@@ -1,0 +1,25 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Project binaries
+/vanity
+/vanity.exe
+/evm-vanity
+/evm-vanity.exe
+/vanity-linux-stub
+
+# Go caches
+/.gocache/
+
+# CUDA runtime cache
+/cuda/cache/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
