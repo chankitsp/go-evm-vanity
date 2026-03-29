@@ -77,22 +77,29 @@ func TestHexSuffixMatcher(t *testing.T) {
 	}
 }
 
-func TestConfirmCUDAHitDerivesMatchingPrivateKey(t *testing.T) {
+func TestConfirmFullGPUCUDAHitDerivesMatchingPrivateKey(t *testing.T) {
 	start := *new(secp256k1.ModNScalar).SetInt(1)
-	pubkeys := make([]byte, 3*64)
-	if _, err := fillSequentialPubkeyRange(context.Background(), start, pubkeys, 3); err != nil {
-		t.Fatalf("fillSequentialPubkeyRange returned error: %v", err)
+	scalars := make([]byte, 3*32)
+	if _, err := fillSequentialScalarRange(context.Background(), start, scalars, 3); err != nil {
+		t.Fatalf("fillSequentialScalarRange returned error: %v", err)
 	}
 
-	hash := crypto.Keccak256(pubkeys[64:128])
+	var scalar secp256k1.ModNScalar
+	var scalarBytes [32]byte
+	copy(scalarBytes[:], scalars[32:64])
+	if overflow := scalar.SetBytes(&scalarBytes); overflow != 0 || scalar.IsZero() {
+		t.Fatal("expected deterministic scalar to be valid")
+	}
+	pub := secp256k1.NewPrivateKey(&scalar).PubKey().SerializeUncompressed()
+	hash := crypto.Keccak256(pub[1:])
 	matcher, err := newHexSuffixMatcher(hex.EncodeToString(hash[30:32]))
 	if err != nil {
 		t.Fatalf("newHexSuffixMatcher returned error: %v", err)
 	}
 
-	result, ok := confirmCUDAHit(start, pubkeys, 1, matcher, 2)
+	result, ok := confirmFullGPUCUDAHit(scalars, 1, matcher, 2)
 	if !ok {
-		t.Fatal("expected confirmCUDAHit to verify the hit")
+		t.Fatal("expected confirmFullGPUCUDAHit to verify the hit")
 	}
 
 	expectedScalar := scalarWithOffset(start, 1)

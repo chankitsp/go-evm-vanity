@@ -130,6 +130,28 @@ func fillSequentialPubkeyRange(ctx context.Context, current secp256k1.ModNScalar
 	return scalarWithOffset(current, uint32(batchSize)), nil
 }
 
+func fillSequentialScalarRange(ctx context.Context, current secp256k1.ModNScalar, scalars []byte, batchSize int) (secp256k1.ModNScalar, error) {
+	scalar := current
+	for i := 0; i < batchSize; i++ {
+		if i%4096 == 0 {
+			select {
+			case <-ctx.Done():
+				return current, ctx.Err()
+			default:
+			}
+		}
+
+		bytes := scalar.Bytes()
+		copy(scalars[i*32:(i+1)*32], bytes[:])
+
+		scalar.Add(scalarOne)
+		if scalar.IsZero() {
+			scalar.Add(scalarOne)
+		}
+	}
+	return scalar, nil
+}
+
 func fillSequentialRangeOnly(ctx context.Context, start secp256k1.ModNScalar, pubkeys []byte, privateKeys []byte, count int) error {
 	scalar := start
 	var point secp256k1.JacobianPoint

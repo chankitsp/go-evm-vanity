@@ -1,26 +1,39 @@
 # CUDA notes
 
-This repository currently uses a correctness-first hybrid `-mode=cuda` / `-mode=auto` path on both Windows and Linux.
+This repository now uses a correctness-first full-GPU pubkey path for `-mode=cuda` / `-mode=auto` on both Windows and Linux.
 
 ## Current design
 
-The CUDA path splits work across CPU and GPU:
+The CUDA path now does the heavy elliptic-curve and hashing work on the GPU:
 
-- CPU generates sequential `secp256k1` pubkeys in batches
-- GPU runs `Keccak-256 + suffix match` across that batch
+- CPU generates sequential scalar batches
+- GPU derives `secp256k1` pubkeys from those scalars
+- GPU runs `Keccak-256 + suffix match`
 - Go verifies any reported hit on the CPU before printing the address/private key
 
-This keeps `cuda` mode aligned with `cpu` mode while still offloading the hashing pass to the GPU.
+This keeps the final result aligned with `cpu` mode while moving the expensive pubkey generation onto the GPU.
 
-## Hybrid optimizations
+## Full-GPU notes
 
-The current hybrid implementation includes a few throughput-focused changes:
+The current full-GPU implementation focuses on correctness first:
 
-- pubkey-only batches on the host, instead of storing every private key
-- double-buffered host memory so CPU can prepare the next batch while the GPU hashes the current one
-- cached NVRTC output under `cuda/cache/` so later runs start faster
+- GPU `secp256k1` pubkey generation is validated against CPU-derived pubkeys
+- GPU Keccak matching still runs in its own kernel after pubkey generation
+- private keys are derived and confirmed on the CPU only for the winning index
+- cached NVRTC output under `cuda/cache/` makes later runs start faster
 
-Private keys are derived only for the winning index after a confirmed hit.
+## GPU pubkey validation
+
+There is now a correctness-first GPU `secp256k1` pubkey self-test path that can
+be compared directly against CPU-derived pubkeys before enabling a full-GPU
+search path.
+
+Examples:
+
+```text
+.\vanity.exe -gpu-pubkey-selftest 256 -mode cuda -suffix 99
+./vanity -gpu-pubkey-selftest 256 -mode cuda -suffix 99
+```
 
 ## Performance notes
 
@@ -35,6 +48,12 @@ Useful batch sizes to try on this machine were:
 ```
 
 Short suffixes are highly luck-driven, so compare `rate=... addr/s` over longer runs instead of judging by which mode finds a hit first.
+
+On the Windows RTX 3080 test machine, recent short-run full-GPU checks were around:
+
+```text
+CUDA full-GPU search: ~0.5M addr/s
+```
 
 ## First run vs later runs
 
@@ -76,4 +95,4 @@ A 9-hex suffix has an average search cost of:
 16^9 = 68,719,476,736 attempts
 ```
 
-So this target is still expensive and may need long runtimes even after hybrid-path tuning.
+So this target is still expensive and may need long runtimes even after full-GPU tuning.

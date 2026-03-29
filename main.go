@@ -12,12 +12,21 @@ import (
 )
 
 func main() {
-	options, err := parseCLI()
+	config, err := parseCLI()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 		os.Exit(1)
 	}
 
+	if config.GPUPubkeySelfTest > 0 {
+		if err := runGPUPubkeySelfTest(config.SearchOptions, config.GPUPubkeySelfTest); err != nil {
+			fmt.Fprintf(os.Stderr, "gpu self-test error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	options := config.SearchOptions
 	engine, fallbackMessage, err := newEngine(options)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "engine error: %v\n", err)
@@ -58,25 +67,39 @@ func main() {
 	}
 }
 
-func parseCLI() (SearchOptions, error) {
+type CLIConfig struct {
+	SearchOptions
+	GPUPubkeySelfTest int
+}
+
+func parseCLI() (CLIConfig, error) {
 	var mode string
 	var suffix string
 	var workers int
 	var progress time.Duration
 	var batchSize int
+	var gpuPubkeySelfTest int
 
 	flag.StringVar(&mode, "mode", "auto", "search mode: auto, cpu, cuda")
 	flag.StringVar(&suffix, "suffix", "999999999", "hex suffix to match against the 40-hex-character EVM address")
 	flag.IntVar(&workers, "workers", runtime.NumCPU(), "number of CPU workers")
 	flag.DurationVar(&progress, "progress", 2*time.Second, "progress print interval")
 	flag.IntVar(&batchSize, "cuda-batch", 1<<16, "GPU batch size for full CUDA vanity search")
+	flag.IntVar(&gpuPubkeySelfTest, "gpu-pubkey-selftest", 0, "validate GPU secp256k1 pubkey generation against CPU for N deterministic scalars and exit")
 	flag.Parse()
 
-	return NormalizeOptions(SearchOptions{
+	options, err := NormalizeOptions(SearchOptions{
 		Mode:             mode,
 		Suffix:           suffix,
 		Workers:          workers,
 		ProgressInterval: progress,
 		CUDABatchSize:    batchSize,
 	})
+	if err != nil {
+		return CLIConfig{}, err
+	}
+	return CLIConfig{
+		SearchOptions:     options,
+		GPUPubkeySelfTest: gpuPubkeySelfTest,
+	}, nil
 }

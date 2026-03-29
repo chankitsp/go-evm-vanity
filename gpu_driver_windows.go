@@ -206,6 +206,16 @@ func (d *cudaDriver) launch(function uintptr, gridX, blockX uint32, params []uns
 	)))
 }
 
+func (d *cudaDriver) launchPubkey(function uintptr, gridX, blockX uint32, dScalars uint64, count int32, dPubKeys uint64, dStatuses uint64) error {
+	params := []unsafe.Pointer{
+		unsafe.Pointer(&dScalars),
+		unsafe.Pointer(&count),
+		unsafe.Pointer(&dPubKeys),
+		unsafe.Pointer(&dStatuses),
+	}
+	return d.launch(function, gridX, blockX, params)
+}
+
 func (d *cudaDriver) check(status uint32) error {
 	if status == 0 {
 		return nil

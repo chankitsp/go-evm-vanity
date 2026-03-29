@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math"
 	"runtime"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -25,7 +24,10 @@ type cudaEngine struct {
 	context        uintptr
 	module         uintptr
 	function       uintptr
+	pubkeyFunction uintptr
+	dScalars       uint64
 	dPubKeys       uint64
+	dStatuses      uint64
 	dSuffixBytes   uint64
 	dFoundIndex    uint64
 	batchSize      int
@@ -34,15 +36,10 @@ type cudaEngine struct {
 	leadingHalf    byte
 }
 
-type cudaBatch struct {
+type cudaScalarBatch struct {
 	start   secp256k1.ModNScalar
 	next    secp256k1.ModNScalar
-	pubkeys []byte
-}
-
-type cudaFillResult struct {
-	batch cudaBatch
-	err   error
+	scalars []byte
 }
 
 func newCUDAEngine(options SearchOptions) (Engine, error) {
@@ -95,8 +92,35 @@ func newCUDAEngine(options SearchOptions) (Engine, error) {
 		return nil, err
 	}
 
+	pubkeyFunction, err := driver.getFunction(module, "secp256k1_pubkey_kernel")
+	if err != nil {
+		driver.unloadModule(module)
+		driver.destroyContext(context)
+		runtime.UnlockOSThread()
+		return nil, err
+	}
+
 	dPubKeys, err := driver.alloc(uintptr(options.CUDABatchSize * 64))
 	if err != nil {
+		driver.unloadModule(module)
+		driver.destroyContext(context)
+		runtime.UnlockOSThread()
+		return nil, err
+	}
+
+	dScalars, err := driver.alloc(uintptr(options.CUDABatchSize * 32))
+	if err != nil {
+		driver.free(dPubKeys)
+		driver.unloadModule(module)
+		driver.destroyContext(context)
+		runtime.UnlockOSThread()
+		return nil, err
+	}
+
+	dStatuses, err := driver.alloc(uintptr(options.CUDABatchSize))
+	if err != nil {
+		driver.free(dScalars)
+		driver.free(dPubKeys)
 		driver.unloadModule(module)
 		driver.destroyContext(context)
 		runtime.UnlockOSThread()
@@ -110,6 +134,8 @@ func newCUDAEngine(options SearchOptions) (Engine, error) {
 
 	dSuffixBytes, err := driver.alloc(uintptr(len(suffixBytes)))
 	if err != nil {
+		driver.free(dStatuses)
+		driver.free(dScalars)
 		driver.free(dPubKeys)
 		driver.unloadModule(module)
 		driver.destroyContext(context)
@@ -118,6 +144,8 @@ func newCUDAEngine(options SearchOptions) (Engine, error) {
 	}
 
 	if err := driver.memcpyHtoD(dSuffixBytes, suffixBytes); err != nil {
+		driver.free(dStatuses)
+		driver.free(dScalars)
 		driver.free(dSuffixBytes)
 		driver.free(dPubKeys)
 		driver.unloadModule(module)
@@ -128,6 +156,8 @@ func newCUDAEngine(options SearchOptions) (Engine, error) {
 
 	dFoundIndex, err := driver.alloc(4)
 	if err != nil {
+		driver.free(dStatuses)
+		driver.free(dScalars)
 		driver.free(dSuffixBytes)
 		driver.free(dPubKeys)
 		driver.unloadModule(module)
@@ -141,7 +171,10 @@ func newCUDAEngine(options SearchOptions) (Engine, error) {
 		context:        context,
 		module:         module,
 		function:       function,
+		pubkeyFunction: pubkeyFunction,
+		dScalars:       dScalars,
 		dPubKeys:       dPubKeys,
+		dStatuses:      dStatuses,
 		dSuffixBytes:   dSuffixBytes,
 		dFoundIndex:    dFoundIndex,
 		batchSize:      options.CUDABatchSize,
@@ -151,18 +184,53 @@ func newCUDAEngine(options SearchOptions) (Engine, error) {
 	}, nil
 }
 
+func (e *cudaEngine) generatePubkeysFromScalars(scalars [][32]byte) ([]byte, []byte, error) {
+	count := len(scalars)
+	if count == 0 {
+		return nil, nil, nil
+	}
+	if count > e.batchSize {
+		return nil, nil, fmt.Errorf("pubkey self-test count %d exceeds cuda-batch %d", count, e.batchSize)
+	}
+
+	scalarBytes := make([]byte, count*32)
+	for i := range scalars {
+		copy(scalarBytes[i*32:], scalars[i][:])
+	}
+
+	pubkeys := make([]byte, count*64)
+	statuses := make([]byte, count)
+
+	if err := e.driver.memcpyHtoD(e.dScalars, scalarBytes); err != nil {
+		return nil, nil, err
+	}
+	if err := e.driver.memcpyHtoD(e.dStatuses, statuses); err != nil {
+		return nil, nil, err
+	}
+
+	gridX := uint32((count + cudaBlockSize - 1) / cudaBlockSize)
+	if err := e.driver.launchPubkey(e.pubkeyFunction, gridX, cudaBlockSize, e.dScalars, int32(count), e.dPubKeys, e.dStatuses); err != nil {
+		return nil, nil, err
+	}
+	if err := e.driver.sync(); err != nil {
+		return nil, nil, err
+	}
+	if err := e.driver.memcpyDtoH(pubkeys, e.dPubKeys); err != nil {
+		return nil, nil, err
+	}
+	if err := e.driver.memcpyDtoH(statuses, e.dStatuses); err != nil {
+		return nil, nil, err
+	}
+
+	return pubkeys, statuses, nil
+}
+
 func (e *cudaEngine) Name() string {
 	return "cuda"
 }
 
 func (e *cudaEngine) Search(ctx context.Context, options SearchOptions) (SearchResult, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	var fillWG sync.WaitGroup
-	defer func() {
-		cancel()
-		fillWG.Wait()
-		e.close()
-	}()
+	defer e.close()
 
 	startTime := time.Now()
 	var attempts uint64
@@ -194,12 +262,12 @@ func (e *cudaEngine) Search(ctx context.Context, options SearchOptions) (SearchR
 		return SearchResult{}, err
 	}
 
-	buffers := [][]byte{
-		make([]byte, e.batchSize*64),
-		make([]byte, e.batchSize*64),
+	scalarBuffers := [][]byte{
+		make([]byte, e.batchSize*32),
+		make([]byte, e.batchSize*32),
 	}
 	foundRaw := make([]byte, 4)
-	currentBatch, err := e.fillBatch(ctx, seed.key, buffers[0], options.Workers)
+	currentBatch, err := fillScalarBatch(ctx, seed.key, scalarBuffers[0], e.batchSize)
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -212,21 +280,15 @@ func (e *cudaEngine) Search(ctx context.Context, options SearchOptions) (SearchR
 		default:
 		}
 
-		if err := e.beginMatchBatch(currentBatch.pubkeys, foundRaw); err != nil {
+		if err := e.beginFullGPUBatch(currentBatch.scalars, foundRaw); err != nil {
 			return SearchResult{}, err
 		}
 
 		nextBuffer := 1 - activeBuffer
-		fillDone := make(chan cudaFillResult, 1)
-		fillWG.Add(1)
-		go func(start secp256k1.ModNScalar, pubkeys []byte) {
-			defer fillWG.Done()
-			nextBatch, fillErr := e.fillBatch(ctx, start, pubkeys, options.Workers)
-			select {
-			case fillDone <- cudaFillResult{batch: nextBatch, err: fillErr}:
-			case <-ctx.Done():
-			}
-		}(currentBatch.next, buffers[nextBuffer])
+		nextBatch, err := fillScalarBatch(ctx, currentBatch.next, scalarBuffers[nextBuffer], e.batchSize)
+		if err != nil {
+			return SearchResult{}, err
+		}
 
 		matchIndex, err := e.finishMatchBatch(foundRaw)
 		if err != nil {
@@ -237,37 +299,25 @@ func (e *cudaEngine) Search(ctx context.Context, options SearchOptions) (SearchR
 
 		if matchIndex >= 0 {
 			total := totalAfterBatch - uint64(e.batchSize) + uint64(matchIndex) + 1
-			result, ok := confirmCUDAHit(currentBatch.start, currentBatch.pubkeys, matchIndex, options.Matcher, total)
+			result, ok := confirmFullGPUCUDAHit(currentBatch.scalars, matchIndex, options.Matcher, total)
 			if ok {
-				cancel()
 				return result, nil
 			}
 		}
 
-		fillResult, err := waitForCUDAFill(ctx, fillDone)
-		if err != nil {
-			return SearchResult{}, err
-		}
-
-		currentBatch = fillResult.batch
+		currentBatch = nextBatch
 		activeBuffer = nextBuffer
 	}
 }
 
-func (e *cudaEngine) fillBatch(ctx context.Context, start secp256k1.ModNScalar, pubkeys []byte, workers int) (cudaBatch, error) {
-	next, err := fillPubkeyBatchParallel(ctx, start, pubkeys, e.batchSize, workers)
-	if err != nil {
-		return cudaBatch{}, err
+func (e *cudaEngine) beginFullGPUBatch(scalars []byte, foundRaw []byte) error {
+	if err := e.driver.memcpyHtoD(e.dScalars, scalars[:e.batchSize*32]); err != nil {
+		return err
 	}
-	return cudaBatch{
-		start:   start,
-		next:    next,
-		pubkeys: pubkeys,
-	}, nil
-}
 
-func (e *cudaEngine) beginMatchBatch(pubkeys []byte, foundRaw []byte) error {
-	if err := e.driver.memcpyHtoD(e.dPubKeys, pubkeys[:e.batchSize*64]); err != nil {
+	count32 := int32(e.batchSize)
+	gridX := uint32((e.batchSize + cudaBlockSize - 1) / cudaBlockSize)
+	if err := e.driver.launchPubkey(e.pubkeyFunction, gridX, cudaBlockSize, e.dScalars, count32, e.dPubKeys, e.dStatuses); err != nil {
 		return err
 	}
 
@@ -276,7 +326,6 @@ func (e *cudaEngine) beginMatchBatch(pubkeys []byte, foundRaw []byte) error {
 		return err
 	}
 
-	count32 := int32(e.batchSize)
 	dPubKeys := e.dPubKeys
 	dSuffixBytes := e.dSuffixBytes
 	suffixLenBytes := e.suffixLenBytes
@@ -294,11 +343,49 @@ func (e *cudaEngine) beginMatchBatch(pubkeys []byte, foundRaw []byte) error {
 		unsafe.Pointer(&dFoundIndex),
 	}
 
-	gridX := uint32((e.batchSize + cudaBlockSize - 1) / cudaBlockSize)
 	if err := e.driver.launch(e.function, gridX, cudaBlockSize, params); err != nil {
 		return err
 	}
 	return nil
+}
+
+func confirmFullGPUCUDAHit(scalars []byte, matchIndex int, matcher hexSuffixMatcher, attempts uint64) (SearchResult, bool) {
+	if matchIndex < 0 || len(scalars) < (matchIndex+1)*32 {
+		return SearchResult{}, false
+	}
+
+	var scalar secp256k1.ModNScalar
+	var scalarBytes [32]byte
+	copy(scalarBytes[:], scalars[matchIndex*32:(matchIndex+1)*32])
+	if overflow := scalar.SetBytes(&scalarBytes); overflow != 0 || scalar.IsZero() {
+		return SearchResult{}, false
+	}
+
+	priv := secp256k1.NewPrivateKey(&scalar)
+	pub := priv.PubKey().SerializeUncompressed()
+	hash := crypto.Keccak256(pub[1:])
+	if !matcher.Match(hash[12:]) {
+		return SearchResult{}, false
+	}
+
+	addressHex := hex.EncodeToString(hash[12:])
+	return SearchResult{
+		Address:       "0x" + addressHex,
+		PrivateKeyHex: hex.EncodeToString(priv.Serialize()),
+		Attempts:      attempts,
+	}, true
+}
+
+func fillScalarBatch(ctx context.Context, start secp256k1.ModNScalar, scalars []byte, batchSize int) (cudaScalarBatch, error) {
+	next, err := fillSequentialScalarRange(ctx, start, scalars, batchSize)
+	if err != nil {
+		return cudaScalarBatch{}, err
+	}
+	return cudaScalarBatch{
+		start:   start,
+		next:    next,
+		scalars: scalars,
+	}, nil
 }
 
 func (e *cudaEngine) finishMatchBatch(foundRaw []byte) (int, error) {
@@ -316,49 +403,15 @@ func (e *cudaEngine) finishMatchBatch(foundRaw []byte) (int, error) {
 	return int(foundIndex), nil
 }
 
-func confirmCUDAHit(start secp256k1.ModNScalar, pubkeys []byte, matchIndex int, matcher hexSuffixMatcher, attempts uint64) (SearchResult, bool) {
-	if matchIndex < 0 {
-		return SearchResult{}, false
-	}
-
-	pubOffset := matchIndex * 64
-	hash := crypto.Keccak256(pubkeys[pubOffset : pubOffset+64])
-	if !matcher.Match(hash[12:]) {
-		return SearchResult{}, false
-	}
-
-	scalar := scalarWithOffset(start, uint32(matchIndex))
-	privBytes := scalar.Bytes()
-	addressHex := hex.EncodeToString(hash[12:])
-	return SearchResult{
-		Address:       "0x" + addressHex,
-		PrivateKeyHex: hex.EncodeToString(privBytes[:]),
-		Attempts:      attempts,
-	}, true
-}
-
-func waitForCUDAFill(ctx context.Context, fillDone <-chan cudaFillResult) (cudaFillResult, error) {
-	select {
-	case <-ctx.Done():
-		return cudaFillResult{}, ctx.Err()
-	case result := <-fillDone:
-		if result.err != nil {
-			if ctx.Err() != nil {
-				return cudaFillResult{}, ctx.Err()
-			}
-			return cudaFillResult{}, result.err
-		}
-		return result, nil
-	}
-}
-
 func (e *cudaEngine) close() {
 	if e.driver == nil {
 		return
 	}
 	e.driver.free(e.dFoundIndex)
 	e.driver.free(e.dSuffixBytes)
+	e.driver.free(e.dStatuses)
 	e.driver.free(e.dPubKeys)
+	e.driver.free(e.dScalars)
 	e.driver.unloadModule(e.module)
 	e.driver.destroyContext(e.context)
 	runtime.UnlockOSThread()

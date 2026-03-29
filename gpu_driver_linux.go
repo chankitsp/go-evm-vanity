@@ -98,6 +98,30 @@ static CUresult codex_cuLaunchKeccakKernel(
 	);
 }
 
+static CUresult codex_cuLaunchPubkeyKernel(
+	void* fn,
+	CUfunction function,
+	unsigned int gridX,
+	unsigned int blockX,
+	uint64_t dScalars,
+	int32_t count,
+	uint64_t dPubKeys,
+	uint64_t dStatuses
+) {
+	CUdeviceptr scalars = (CUdeviceptr)dScalars;
+	CUdeviceptr pubkeys = (CUdeviceptr)dPubKeys;
+	CUdeviceptr statuses = (CUdeviceptr)dStatuses;
+	void* kernelParams[] = {
+		&scalars,
+		&count,
+		&pubkeys,
+		&statuses
+	};
+	return ((CUresult (*)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, void*, void**, void**))fn)(
+		function, gridX, 1, 1, blockX, 1, 1, 0, NULL, kernelParams, NULL
+	);
+}
+
 static CUresult codex_cuGetErrorString(void* fn, CUresult status, const char** out) {
 	return ((CUresult (*)(CUresult, const char**))fn)(status, out);
 }
@@ -322,6 +346,19 @@ func (d *cudaDriver) launch(function uintptr, gridX, blockX uint32, params []uns
 		oddSuffix,
 		leadingHalf,
 		dFoundIndex,
+	)))
+}
+
+func (d *cudaDriver) launchPubkey(function uintptr, gridX, blockX uint32, dScalars uint64, count int32, dPubKeys uint64, dStatuses uint64) error {
+	return d.check(uint32(C.codex_cuLaunchPubkeyKernel(
+		d.launchKernelProc,
+		C.CUfunction(function),
+		C.uint(gridX),
+		C.uint(blockX),
+		C.uint64_t(dScalars),
+		C.int32_t(count),
+		C.uint64_t(dPubKeys),
+		C.uint64_t(dStatuses),
 	)))
 }
 
